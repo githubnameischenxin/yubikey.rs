@@ -307,6 +307,8 @@ impl<'tx> Transaction<'tx> {
                     return Err(Error::SizeError);
                 }
             }
+            AlgorithmId::Ed25519 => {
+            }
         }
 
         let bytes = if in_len < 0x80 {

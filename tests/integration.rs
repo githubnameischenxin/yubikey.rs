@@ -3,20 +3,20 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms, trivial_casts, unused_qualifications)]
 
+use der::{asn1::BitString, oid::ObjectIdentifier, pem::{Base64Decoder, LineEnding}, Decode, EncodePem};
 use log::trace;
+use nom::AsBytes;
 use once_cell::sync::Lazy;
+use openssl::x509::X509;
 use rand_core::{OsRng, RngCore};
 use rsa::{pkcs1v15, RsaPublicKey};
-use sha2::{Digest, Sha256};
-use signature::hazmat::PrehashVerifier;
-use std::{env, str::FromStr, sync::Mutex, time::Duration};
-use x509_cert::{der::Encode, name::Name, serial_number::SerialNumber, time::Validity};
+use sha2::{Digest, Sha256, Sha512_256};
+use signature::{hazmat::PrehashVerifier, SignerMut};
+use sp_core::{ByteArray, Pair};
+use std::{borrow::{Borrow, BorrowMut}, env, fs::File, io::{Read, Write}, str::FromStr, sync::Mutex, time::Duration};
+use x509_cert::{builder::{Builder, RequestBuilder}, der::{referenced::OwnedToRef, Encode}, name::Name, request::{CertReq, CertReqInfo}, serial_number::SerialNumber, spki::{AlgorithmIdentifier, AlgorithmIdentifierOwned, DynSignatureAlgorithmIdentifier, SubjectPublicKeyInfoOwned}, time::Validity};
 use yubikey::{
-    certificate,
-    certificate::yubikey_signer,
-    certificate::Certificate,
-    piv::{self, AlgorithmId, Key, ManagementSlotId, RetiredSlotId, SlotId},
-    Error, MgmKey, PinPolicy, Serial, TouchPolicy, YubiKey,
+    certificate::{self, yubikey_signer::{self}, CertInfo, Certificate}, piv::{self, AlgorithmId, Key, ManagementSlotId, RetiredSlotId, SlotId}, Buffer, Error, MgmKey, PinPolicy, Serial, TouchPolicy, YubiKey
 };
 
 static YUBIKEY: Lazy<Mutex<YubiKey>> = Lazy::new(|| {
@@ -333,3 +333,275 @@ fn test_parse_cert_from_der() {
         "CN=Ferdinand Linnenberg CA"
     );
 }
+
+//
+// key generation ed25519
+//
+
+#[test]
+#[ignore]
+fn test_generate_key_ed25519() {
+    let mut yubikey = YUBIKEY.lock().unwrap();
+    assert!(yubikey.verify_pin(b"123456").is_ok());
+    assert!(yubikey.authenticate(MgmKey::default()).is_ok());
+
+    let slot = SlotId::Retired(RetiredSlotId::R4);
+
+    // Generate a new key in the selected slot.
+    let generated = piv::generate(
+        &mut yubikey,
+        slot,
+        AlgorithmId::Ed25519,
+        PinPolicy::Default,
+        TouchPolicy::Default,
+    )
+    .unwrap();
+
+    let pem = generated.to_pem(der::pem::LineEnding::LF).unwrap();
+    trace!("{:?}", pem);
+}
+
+#[test]
+#[ignore]
+fn test_get_public_key() {
+    let mut yubikey = YUBIKEY.lock().unwrap();
+    assert!(yubikey.verify_pin(b"123456").is_ok());
+
+    let slot = SlotId::KeyManagement;
+
+    let public_key_info = match piv::metadata(&mut yubikey, slot) {
+        Ok(metadata) => metadata.public,
+        Err(Error::NotSupported) => {
+            // Some YubiKeys don't support metadata
+            eprintln!("metadata not supported by this YubiKey");
+            None
+        }
+        Err(err) => panic!("{}", err),
+    }.unwrap();
+    let pem = public_key_info.to_pem(LineEnding::LF).unwrap();
+    println!("============= PEM ===========");
+    println!("pem: {}", pem);
+    println!("=============================");
+}
+
+#[test]
+#[ignore]
+fn test_generate_csr_ed25519() {
+    let mut yubikey = YUBIKEY.lock().unwrap();
+    assert!(yubikey.verify_pin(b"123456").is_ok());
+    assert!(yubikey.authenticate(MgmKey::default()).is_ok());
+
+    let slot = SlotId::Retired(RetiredSlotId::R4);
+
+    let public_key = match piv::metadata(&mut yubikey, slot) {
+        Ok(metadata) => metadata.public,
+        Err(Error::NotSupported) => {
+            eprintln!("metadata not supported by this YubiKey");
+            None
+        }
+        Err(err) => panic!("{}", err),
+    }.unwrap();
+
+    // Generate a new key in the selected slot.
+    let csr_pem = generate_csr(&mut yubikey, slot, public_key).unwrap();
+    let _ = save_file(&csr_pem.as_bytes(), &format!("/Users/chenxin/projects/test/{}_csr.pem", slot)).unwrap();
+    println!("{:?}", csr_pem);
+}
+
+fn generate_csr(yubikey: &mut YubiKey, slot: SlotId, subject_pki: SubjectPublicKeyInfoOwned) -> Result<String, Error> {
+    
+    let subject = Name::from_str(
+        "C=CN,ST=BeiJing,L=BeiJing,O=Ferghana Group,OU=Ferghana Group IT Department,CN=ecaasospoc"
+    ).unwrap();
+
+    let version = Default::default();
+    let public_key = subject_pki.to_owned();
+    let attributes = Default::default();
+    // let extension_req = x509_cert::request::ExtensionReq::default();
+    let ed25519_oid = ObjectIdentifier::new_unwrap("1.3.101.112");
+    let algorithm = AlgorithmIdentifierOwned {
+        oid: ed25519_oid,
+        parameters: None,
+    };
+
+    let cert_req_info = CertReqInfo {
+        version,
+        subject,
+        public_key,
+        attributes,
+    };
+    // cert_req_info.attributes.insert(extension_req.clone().try_into()?)?;
+    let cert_req_info_der = cert_req_info.to_der().unwrap();
+    let signature = sign_ed25519(yubikey, slot, &cert_req_info_der).unwrap().to_vec();
+    let signature_bitstring = BitString::from_bytes(&signature).unwrap();
+
+    let cert_req = CertReq {
+        info: cert_req_info,
+        algorithm,
+        signature: signature_bitstring,
+    };
+
+    let csr_pem = cert_req.to_pem(der::pem::LineEnding::LF).unwrap();
+    Ok(csr_pem)
+}
+
+fn save_file(content: &[u8], file_path: &str) -> std::io::Result<()> {
+    let mut file = File::create(file_path)?;
+    file.write_all(content)?;
+
+    Ok(())
+}
+
+fn read_file(file_path: &str) -> std::io::Result<Vec<u8>> {
+    let mut file = File::open(file_path)?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
+
+    Ok(content)
+}
+
+#[test]
+#[ignore]
+fn test_import_cert() {
+    let cert_pem = include_str!("/Users/chenxin/projects/test/R4_cert.pem");
+    let start = cert_pem.find("-----BEGIN CERTIFICATE-----")
+        .ok_or("Invalid PEM: no BEGIN CERTIFICATE header").unwrap()
+        + "-----BEGIN CERTIFICATE-----".len();
+    let end = cert_pem.find("-----END CERTIFICATE-----")
+        .ok_or("Invalid PEM: no END CERTIFICATE footer").unwrap();
+    let base64_data = &cert_pem[start..end].replace("\n", "").replace("\r", "");
+    
+    let mut decoder = Base64Decoder::new(&base64_data.as_bytes()).unwrap();
+    let mut buf= Vec::new();
+    let data = decoder.decode_to_end(&mut buf).unwrap();
+    let cert = Certificate::from_bytes(data.to_vec()).unwrap();
+
+    let mut yubikey = YUBIKEY.lock().unwrap();
+    assert!(yubikey.verify_pin(b"123456").is_ok());
+    assert!(yubikey.authenticate(MgmKey::default()).is_ok());
+
+    let slot = SlotId::Retired(RetiredSlotId::R4);
+
+    let _ = cert.write(&mut yubikey, slot, CertInfo::Uncompressed).unwrap();
+}
+
+#[test]
+#[ignore]
+fn test_sign_ed25519() {
+    let mut yubikey = YUBIKEY.lock().unwrap();
+    assert!(yubikey.verify_pin(b"123456").is_ok());
+    assert!(yubikey.authenticate(MgmKey::default()).is_ok());
+
+    let slot = SlotId::KeyManagement;
+    let msg = b"hello world asdfasdf asdkfjaskdfja sdfkajsdfk askdfja sdfkajsdfkajsdfkajsdfasdkfj ";
+    
+    let raw_in = msg;
+    let signature = sign_ed25519(&mut yubikey, slot, raw_in.as_bytes()).unwrap();
+    let signature_bytes = signature.to_vec();
+    println!("signature bytes: {:?}", signature_bytes);
+    println!("signature len: {:?}", signature_bytes.len());
+    let _ = save_file(&signature_bytes, "/Users/chenxin/projects/test/9d_signature.bin");
+
+    let cert_pem = include_str!("/Users/chenxin/projects/test/9d_cert.pem");
+    let cert = openssl::x509::X509::from_pem(cert_pem.as_bytes()).unwrap();
+    let public_key = cert.public_key().unwrap();
+    let public_key_to_pem = public_key.public_key_to_pem().unwrap();
+    let pub_pem = String::from_utf8(public_key_to_pem).unwrap();
+    println!("pub_pem: {}", pub_pem);
+    
+    let mut verifier = openssl::sign::Verifier::new_without_digest(&public_key).unwrap();
+    println!("verify: {:?}", verifier.verify_oneshot(&signature_bytes, raw_in.as_bytes()).unwrap());
+
+}
+
+fn sign_ed25519(yubikey: &mut YubiKey, slot: SlotId, raw_in: &[u8]) -> Result<Buffer, Error> {
+    assert!(yubikey.verify_pin(b"123456").is_ok());
+    let signature = piv::sign_data(
+        yubikey, 
+        raw_in, 
+        AlgorithmId::Ed25519, 
+        slot
+    );
+    signature
+}
+
+/// 使用 polkadot sp-core 验证签名
+#[test]
+#[ignore]
+fn test_verify_ed25519() {
+    // let mut yubikey = YUBIKEY.lock().unwrap();
+    // assert!(yubikey.verify_pin(b"123456").is_ok());
+    // assert!(yubikey.authenticate(MgmKey::default()).is_ok());
+
+    // let slot = SlotId::KeyManagement;
+
+    let msg = b"hello world asdfasdf asdkfjaskdfja sdfkajsdfk askdfja sdfkajsdfkajsdfkajsdfasdkfj ";
+
+    // 读取签名
+    let signature = read_file("/Users/chenxin/projects/test/9d_signature.bin").unwrap();
+
+    // 读取证书的公钥
+    let cert_pem = include_str!("/Users/chenxin/projects/test/9d_cert.pem");
+    let cert = openssl::x509::X509::from_pem(cert_pem.as_bytes()).unwrap();
+    let public_key = cert.public_key().unwrap();
+    let public_key_to_pem = public_key.public_key_to_pem().unwrap();
+    let pub_pem = String::from_utf8(public_key_to_pem).unwrap();
+    println!("pub_pem: {}", pub_pem);
+
+    // openssl 验证签名
+    let mut verifier = openssl::sign::Verifier::new_without_digest(&public_key).unwrap();
+    println!("verify: {:?}", verifier.verify_oneshot(&signature, msg).unwrap());
+
+    // polkadot sp-core 验证签名
+    let pubkey = sp_core::ed25519::Public::from_slice(&public_key.raw_public_key().unwrap()).unwrap();
+    let sig = sp_core::ed25519::Signature::from_slice(&signature).unwrap();
+    
+    let res = sp_core::ed25519::Pair::verify(&sig, msg, &pubkey);
+    println!("polkadot verify: {:?}", res);
+
+}
+
+#[test]
+#[ignore]
+fn test_verify_ed25519_2() {
+    let mut yubikey = YUBIKEY.lock().unwrap();
+    assert!(yubikey.verify_pin(b"123456").is_ok());
+    assert!(yubikey.authenticate(MgmKey::default()).is_ok());
+
+    let slot = SlotId::KeyManagement;
+
+    let msg = b"hello world";
+
+    // 签名
+    let raw_in = msg;
+    let signature = sign_ed25519(&mut yubikey, slot, raw_in.as_bytes()).unwrap();
+    let signature_bytes = signature.to_vec();
+
+
+    // 读取公钥
+    let public_key_info = match piv::metadata(&mut yubikey, slot) {
+        Ok(metadata) => metadata.public,
+        Err(Error::NotSupported) => {
+            // Some YubiKeys don't support metadata
+            eprintln!("metadata not supported by this YubiKey");
+            None
+        }
+        Err(err) => panic!("{}", err),
+    }.unwrap();
+
+    // openssl 验证签名
+    let public_key = openssl::pkey::PKey::public_key_from_der(&public_key_info.to_der().unwrap()).unwrap();
+    let mut verifier = openssl::sign::Verifier::new_without_digest(&public_key).unwrap();
+    println!("verify: {:?}", verifier.verify_oneshot(&signature_bytes, msg).unwrap());
+    
+    // polkadot sp-core 验证签名
+    let pubkey = sp_core::ed25519::Public::from_slice(&public_key_info.subject_public_key.as_bytes().unwrap()).unwrap();
+    let sig = sp_core::ed25519::Signature::from_slice(&signature_bytes).unwrap();
+    
+    let res = sp_core::ed25519::Pair::verify(&sig, msg, &pubkey);
+    println!("polkadot verify: {:?}", res);
+
+}
+
+
+

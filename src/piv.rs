@@ -43,21 +43,15 @@
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 use crate::{
-    apdu::{Ins, StatusWords},
-    certificate::{self, Certificate},
-    consts::CB_OBJ_MAX,
-    error::{Error, Result},
-    policy::{PinPolicy, TouchPolicy},
-    serialization::*,
-    setting,
-    yubikey::YubiKey,
-    Buffer, ObjectId,
+    apdu::{Ins, StatusWords}, certificate::{self, Certificate}, consts::CB_OBJ_MAX, error::{Error, Result}, policy::{PinPolicy, TouchPolicy}, serialization::*, setting, yubikey::YubiKey, Buffer, ObjectId
 };
+use der::Encode;
 use elliptic_curve::{sec1::EncodedPoint as EcPublicKey, PublicKey};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
+use nom::AsBytes;
 use p256::NistP256;
 use p384::NistP384;
-use rsa::{pkcs8::EncodePublicKey, BigUint, RsaPublicKey};
+use rsa::{pkcs8::{DecodePublicKey, EncodePublicKey}, BigUint, RsaPublicKey};
 use std::{
     fmt::{Display, Formatter},
     str::FromStr,
@@ -82,10 +76,12 @@ pub(crate) const APPLET_ID: &[u8] = &[0xa0, 0x00, 0x00, 0x03, 0x08];
 
 const CB_ECC_POINTP256: usize = 65;
 const CB_ECC_POINTP384: usize = 97;
+const CB_ED25519_POINT: usize = 32;
 
 const TAG_RSA_MODULUS: u8 = 0x81;
 const TAG_RSA_EXP: u8 = 0x82;
 const TAG_ECC_POINT: u8 = 0x86;
+const TAG_ED25519_POINT: u8 = 0x86;
 
 #[cfg(feature = "untested")]
 const KEYDATA_LEN: usize = 1024;
@@ -487,6 +483,9 @@ pub enum AlgorithmId {
 
     /// ECDSA with the NIST P384 curve.
     EccP384,
+
+    /// EdDSA with the Ed25519 curve.
+    Ed25519,
 }
 
 impl TryFrom<u8> for AlgorithmId {
@@ -498,6 +497,7 @@ impl TryFrom<u8> for AlgorithmId {
             0x07 => Ok(AlgorithmId::Rsa2048),
             0x11 => Ok(AlgorithmId::EccP256),
             0x14 => Ok(AlgorithmId::EccP384),
+            0xE0 => Ok(AlgorithmId::Ed25519),
             _ => Err(Error::AlgorithmError),
         }
     }
@@ -510,6 +510,7 @@ impl From<AlgorithmId> for u8 {
             AlgorithmId::Rsa2048 => 0x07,
             AlgorithmId::EccP256 => 0x11,
             AlgorithmId::EccP384 => 0x14,
+            AlgorithmId::Ed25519 => 0xE0,
         }
     }
 }
@@ -682,7 +683,7 @@ pub fn generate(
                     },
                     _ => error!("{} (pin policy not supported?)", err_msg),
                 }
-
+                
                 return Err(Error::AlgorithmError);
             }
             StatusWords::SecurityStatusError => {
@@ -1208,6 +1209,36 @@ fn read_public_key(
             }
             .map_err(|_| Error::InvalidObject)?;
 
+            Ok(SubjectPublicKeyInfoOwned::from_der(pubkey.as_bytes())?)
+        }
+        AlgorithmId::Ed25519 => {
+            // 2-byte ASN.1 tag, 1-byte length (because all supported EC pubkey lengths
+            // are shorter than 128 bytes, fitting into a definite short ASN.1 length).
+            let data = if skip_asn1_tag { &input[3..] } else { input };
+
+            let len = CB_ED25519_POINT;
+
+            let (_, tlv) = Tlv::parse(data)?;
+
+            if tlv.tag != TAG_ED25519_POINT {
+                error!("failed to parse public key structure");
+                return Err(Error::ParseError);
+            }
+            
+            // the curve point should always be determined by the curve
+            if tlv.value.len() != len {
+                error!("unexpected length");
+                return Err(Error::AlgorithmError);
+            }
+            let point = tlv.value.to_vec();
+            let mut point32 = [0u8; 32];
+            point32.copy_from_slice(&point);
+            
+            let pubkey = ed25519::PublicKeyBytes(point32)
+                .to_public_key_der()
+                .map_err(|_| Error::InvalidObject)?
+                .to_der()
+                .map_err(|_| Error::InvalidObject)?;
             Ok(SubjectPublicKeyInfoOwned::from_der(pubkey.as_bytes())?)
         }
     }
