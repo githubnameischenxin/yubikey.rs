@@ -874,7 +874,7 @@ pub fn import_ecc_key(
 /// Generate an attestation certificate for a stored key.
 ///
 /// <https://developers.yubico.com/PIV/Introduction/PIV_attestation.html>
-#[cfg(feature = "untested")]
+// #[cfg(feature = "untested")]
 pub fn attest(yubikey: &mut YubiKey, key: SlotId) -> Result<Buffer> {
     let templ = [0, Ins::Attest.code(), key.into(), 0];
     let txn = yubikey.begin_transaction()?;

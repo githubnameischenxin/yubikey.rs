@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs, rust_2018_idioms, trivial_casts, unused_qualifications)]
 
-use der::{asn1::BitString, oid::ObjectIdentifier, pem::{Base64Decoder, LineEnding}, Decode, EncodePem};
+use der::{asn1::BitString, oid::ObjectIdentifier, pem::{Base64Decoder, LineEnding}, Decode, DecodePem, EncodePem};
 use log::trace;
 use nom::AsBytes;
 use once_cell::sync::Lazy;
@@ -34,7 +34,7 @@ static YUBIKEY: Lazy<Mutex<YubiKey>> = Lazy::new(|| {
 
     trace!("serial: {}", yubikey.serial());
     trace!("version: {}", yubikey.version());
-
+    println!("serial: {}, version: {}", yubikey.serial(), yubikey.version());
     Mutex::new(yubikey)
 });
 
@@ -345,7 +345,7 @@ fn test_generate_key_ed25519() {
     assert!(yubikey.verify_pin(b"123456").is_ok());
     assert!(yubikey.authenticate(MgmKey::default()).is_ok());
 
-    let slot = SlotId::Retired(RetiredSlotId::R4);
+    let slot = SlotId::Retired(RetiredSlotId::R6);
 
     // Generate a new key in the selected slot.
     let generated = piv::generate(
@@ -391,7 +391,7 @@ fn test_generate_csr_ed25519() {
     assert!(yubikey.verify_pin(b"123456").is_ok());
     assert!(yubikey.authenticate(MgmKey::default()).is_ok());
 
-    let slot = SlotId::Retired(RetiredSlotId::R4);
+    let slot = SlotId::Retired(RetiredSlotId::R6);
 
     let public_key = match piv::metadata(&mut yubikey, slot) {
         Ok(metadata) => metadata.public,
@@ -463,7 +463,7 @@ fn read_file(file_path: &str) -> std::io::Result<Vec<u8>> {
 #[test]
 #[ignore]
 fn test_import_cert() {
-    let cert_pem = include_str!("/Users/chenxin/projects/test/R4_cert.pem");
+    let cert_pem = include_str!("/Users/chenxin/projects/test/R6_cert.pem");
     let start = cert_pem.find("-----BEGIN CERTIFICATE-----")
         .ok_or("Invalid PEM: no BEGIN CERTIFICATE header").unwrap()
         + "-----BEGIN CERTIFICATE-----".len();
@@ -480,7 +480,7 @@ fn test_import_cert() {
     assert!(yubikey.verify_pin(b"123456").is_ok());
     assert!(yubikey.authenticate(MgmKey::default()).is_ok());
 
-    let slot = SlotId::Retired(RetiredSlotId::R4);
+    let slot = SlotId::Retired(RetiredSlotId::R6);
 
     let _ = cert.write(&mut yubikey, slot, CertInfo::Uncompressed).unwrap();
 }
@@ -604,4 +604,110 @@ fn test_verify_ed25519_2() {
 }
 
 
+/// Use f9 slot authorization other slot key generate from yubikey
+#[test]
+#[ignore]
+fn test_f9() {
+    let mut yubikey = YUBIKEY.lock().unwrap();
+    assert!(yubikey.verify_pin(b"123456").is_ok());
 
+    // let slot = SlotId::Retired(RetiredSlotId::R4);
+    // let slot = SlotId::Signature;
+    let slot = SlotId::Retired(RetiredSlotId::R6);
+
+    let cert_der = piv::attest(&mut yubikey, slot).unwrap();
+    let cert_der_bytes = cert_der.to_vec();
+    let cert = x509_cert::Certificate::from_der(&cert_der_bytes).unwrap();
+
+    let cert_pem = cert.to_pem(LineEnding::LF).unwrap();
+    println!("============= PEM ===========");
+    println!("pem: {}", cert_pem);
+    println!("=============================");
+    let _ = save_file(cert_pem.as_bytes(), "/Users/chenxin/projects/test/attest_R6_cert.pem").unwrap();
+}
+
+
+#[test]
+#[ignore]
+fn test_get_cert_by_slot() {
+    let mut yubikey = YUBIKEY.lock().unwrap();
+
+    let slot = SlotId::Attestation;
+
+    let keys_result = Key::list(&mut yubikey);
+    assert!(keys_result.is_ok());
+    // for key in keys_result.unwrap() {
+    //     if key.slot() == slot {
+    //         let cert = key.certificate().to_owned();
+    //         let cert_pem = cert.cert.to_pem(LineEnding::LF).unwrap();
+    //         println!("pem: {}", cert_pem);
+    //         let _ = save_file(cert_pem.as_bytes(), "/Users/chenxin/projects/test/f9_cert.pem").unwrap();
+    //     }
+    // }
+}
+
+#[test]
+#[ignore]
+fn test_read_attest_cert(){
+    let cert_pem = include_str!("/Users/chenxin/projects/test/attest_R6_cert.pem");
+    let cert = x509_cert::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+    for ext in cert.tbs_certificate.extensions {
+        for value in ext {
+            if value.extn_id.to_string() == "1.3.6.1.4.1.41482.3.7" {
+                let bytes = value.extn_value.as_bytes()[2..].to_vec();
+                let serial = u32::from_be_bytes(bytes.try_into().unwrap());
+                println!("[critical:{:?}] {:?} => {:?}", value.critical, value.extn_id.to_string(), serial);
+            }else{
+                println!("[critical:{:?}] {:?} => {:?}", value.critical, value.extn_id.to_string(), value.extn_value.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore]
+fn test_yubico_piv_ca() {
+    // f9 cert
+    let cert_pem = include_str!("/Users/chenxin/projects/test/f9_cert.pem");
+    let cert = openssl::x509::X509::from_pem(cert_pem.as_bytes()).unwrap();
+    let public_key = cert.public_key().unwrap();
+
+    // yubico ca cert
+    let ca_cert_pem = include_str!("/Users/chenxin/projects/test/yubico_piv_ca_cert.pem");
+    let ca_cert = openssl::x509::X509::from_pem(ca_cert_pem.as_bytes()).unwrap();
+    let ca_public_key = ca_cert.public_key().unwrap();
+    
+    // f9 cert is yubico ca sign
+    let res = cert.verify(&ca_public_key).unwrap();
+    assert!(res);
+
+    // f9 sign 87 slot cert
+    let attest_r6_cert_pem = include_str!("/Users/chenxin/projects/test/attest_R6_cert.pem");
+    let attest_r6_cert = openssl::x509::X509::from_pem(attest_r6_cert_pem.as_bytes()).unwrap();
+    let attest_r6_res = attest_r6_cert.verify(&public_key).unwrap();
+    assert!(attest_r6_res);
+
+    // 87 slot cert
+    let r6_cert_pem = include_str!("/Users/chenxin/projects/test/R6_cert.pem");
+    let r6_cert = openssl::x509::X509::from_pem(r6_cert_pem.as_bytes()).unwrap();
+    let r6_public_key = r6_cert.public_key().unwrap();
+    let attest_r6_cert_public_key = attest_r6_cert.public_key().unwrap();
+
+    assert_eq!(
+        r6_public_key.raw_public_key().unwrap(), 
+        attest_r6_cert_public_key.raw_public_key().unwrap()
+    );
+    
+    
+    let chain = openssl::stack::Stack::new().unwrap();
+    
+    let mut store_bldr = openssl::x509::store::X509StoreBuilder::new().unwrap();
+    store_bldr.add_cert(ca_cert).unwrap();
+    store_bldr.add_cert(cert).unwrap();
+    let store = store_bldr.build();
+
+    let mut context = openssl::x509::X509StoreContext::new().unwrap();
+    assert!(context
+        .init(&store, &attest_r6_cert, &chain, |c| c.verify_cert())
+        .unwrap());
+}
