@@ -463,25 +463,31 @@ fn read_file(file_path: &str) -> std::io::Result<Vec<u8>> {
 #[test]
 #[ignore]
 fn test_import_cert() {
-    let cert_pem = include_str!("/Users/chenxin/projects/test/R6_cert.pem");
-    let start = cert_pem.find("-----BEGIN CERTIFICATE-----")
-        .ok_or("Invalid PEM: no BEGIN CERTIFICATE header").unwrap()
-        + "-----BEGIN CERTIFICATE-----".len();
-    let end = cert_pem.find("-----END CERTIFICATE-----")
-        .ok_or("Invalid PEM: no END CERTIFICATE footer").unwrap();
-    let base64_data = &cert_pem[start..end].replace("\n", "").replace("\r", "");
+    let slot = SlotId::Retired(RetiredSlotId::R6);
     
-    let mut decoder = Base64Decoder::new(&base64_data.as_bytes()).unwrap();
-    let mut buf= Vec::new();
-    let data = decoder.decode_to_end(&mut buf).unwrap();
-    let cert = Certificate::from_bytes(data.to_vec()).unwrap();
+    let cert_pem = include_str!("/Users/chenxin/projects/test/R6_cert.pem");
+    
+
+    // let start = cert_pem.find("-----BEGIN CERTIFICATE-----")
+    //     .ok_or("Invalid PEM: no BEGIN CERTIFICATE header").unwrap()
+    //     + "-----BEGIN CERTIFICATE-----".len();
+    // let end = cert_pem.find("-----END CERTIFICATE-----")
+    //     .ok_or("Invalid PEM: no END CERTIFICATE footer").unwrap();
+    // let base64_data = &cert_pem[start..end].replace("\n", "").replace("\r", "");
+    
+    // let mut decoder = Base64Decoder::new(&base64_data.as_bytes()).unwrap();
+    // let mut buf= Vec::new();
+    // let data = decoder.decode_to_end(&mut buf).unwrap();
+    // let cert = Certificate::from_bytes(data.to_vec()).unwrap();
+    
+    let x509_cert = x509_cert::Certificate::from_pem(cert_pem).unwrap();
+    let bytes = x509_cert.to_der().unwrap();
+    let cert = Certificate::from_bytes(bytes).unwrap();
 
     let mut yubikey = YUBIKEY.lock().unwrap();
     assert!(yubikey.verify_pin(b"123456").is_ok());
     assert!(yubikey.authenticate(MgmKey::default()).is_ok());
-
-    let slot = SlotId::Retired(RetiredSlotId::R6);
-
+    
     let _ = cert.write(&mut yubikey, slot, CertInfo::Uncompressed).unwrap();
 }
 
